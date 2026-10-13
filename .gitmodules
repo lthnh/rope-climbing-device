@@ -1,0 +1,3 @@
+[submodule "ExtLibs/Modbus-STM32-HAL-FreeRTOS"]
+	path = ExtLibs/Modbus-STM32-HAL-FreeRTOS
+	url = https://github.com/alejoseb/Modbus-STM32-HAL-FreeRTOS
