@@ -4,8 +4,8 @@ import subprocess
 import tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'Core/Src/main.c').read_text()
-start = source.index('void MotorControlTask(void *argument)\n{')
-end = source.index('/* USER CODE END 0 */', start)
+start = source.index('static void RecordMotionPulse(void)\n{')
+end = source.index('void MotionTrackingTask(void *argument)\n{', start)
 harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -13,6 +13,12 @@ harness = r'''
 #include <stdlib.h>
 #define MOTOR_EN (1u << 0u)
 #define MOTOR_CW (1u << 1u)
+#define MOTION_TRACK_EN (1u << 2u)
+#define TIM3 3
+#define TIM3_IRQn 3
+#define TIM_FLAG_CC1 1
+#define HAL_TIM_ACTIVE_CHANNEL_1 1
+#define RESET 0
 #define READ_BIT(REG, BIT) ((REG) & (BIT))
 #define GPIOB 0
 #define CW_PIN 10
@@ -23,7 +29,18 @@ harness = r'''
 #define HAL_OK 0
 #define pdTRUE 1
 typedef int GPIO_PinState;
-static int htim3, enabled, direction, pwm, step, locked, pause, reads, fault;
+typedef struct { int Instance, Channel, counter, pending; } TIM_HandleTypeDef;
+static TIM_HandleTypeDef htim3 = {.Instance = TIM3};
+static int enabled, direction, pwm, step, locked, pause, reads, fault, critical;
+static volatile bool motionTrackingEnabled, motionMotorRunning;
+static volatile int32_t motionDirection = 1, motionIntervalPulses;
+static volatile uint64_t motionPosition;
+#define taskENTER_CRITICAL() (++critical)
+#define taskEXIT_CRITICAL() (--critical)
+#define __HAL_TIM_GET_FLAG(timer, flag) ((timer)->pending)
+#define __HAL_TIM_CLEAR_FLAG(timer, flag) ((timer)->pending = 0)
+#define __HAL_TIM_SET_COUNTER(timer, value) ((timer)->counter = (value))
+static void HAL_NVIC_ClearPendingIRQ(int irq) { (void)irq; assert(critical); }
 static uint16_t modbusCoilsData[1];
 static struct { int ModBusSphrHandle; } modbusHandle;
 static const uint16_t commands[] = {0,1,1,3,3,0,3,1,5,0,0,1,1};
@@ -38,21 +55,24 @@ static int xSemaphoreTake(int handle, int timeout) {
 static void xSemaphoreGive(int handle) { (void)handle; assert(locked); locked = 0; }
 static void HAL_GPIO_WritePin(int port, int pin, int value) {
   (void)port; assert(!locked);
-  if (pin == CW_PIN) { assert(!enabled && !pwm); direction = value; pause = 1; }
+  if (pin == CW_PIN) { assert(!enabled && !pwm); direction = value; pause = 1; htim3.pending = 1; }
   else { enabled = value; if (value) assert(pwm); }
 }
-static int HAL_TIM_PWM_Start(int *timer, int channel) {
+static int HAL_TIM_PWM_Start_IT(TIM_HandleTypeDef *timer, int channel) {
   (void)timer; (void)channel; assert(!locked && !enabled && !pwm);
   if (fault == 1) return 1;
+  assert(critical && !timer->pending && timer->counter == 0);
   pwm = 1; return HAL_OK;
 }
-static int HAL_TIM_PWM_Stop(int *timer, int channel) {
+static int HAL_TIM_PWM_Stop_IT(TIM_HandleTypeDef *timer, int channel) {
   (void)timer; (void)channel; assert(!locked && !enabled && pwm);
   if (fault == 2) return 1;
   pwm = 0; return HAL_OK;
 }
+static void FlushMotionPulse(void);
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim);
 static void osDelay(int ticks) {
-  assert(ticks == 10 && !locked);
+  assert(ticks == 10 && !locked && !critical);
   if (pause) {
     pause = 0; assert(!enabled && !pwm);
     if (step == 3) modbusCoilsData[0] = 0;
@@ -63,21 +83,36 @@ static void osDelay(int ticks) {
   const int directions[] = {0,1,1,0,0,0,0,1,1,1,1,1,1};
   assert(enabled == running[step] && pwm == running[step]);
   assert(direction == directions[step]);
+  assert(motionMotorRunning == (bool)pwm);
+  if (pwm) assert(motionDirection == (direction ? 1 : -1));
+  if (step >= 10) assert(motionPosition == 4);
+  if (pwm) {
+    taskENTER_CRITICAL();
+    FlushMotionPulse();
+    taskEXIT_CRITICAL();
+    htim3.Channel = HAL_TIM_ACTIVE_CHANNEL_1;
+    HAL_TIM_PWM_PulseFinishedCallback(&htim3);
+    htim3.pending = 1;
+  }
   if (++step == 13) { assert(!fault); exit(0); }
   reads = 0; modbusCoilsData[0] = commands[step];
 }
 '''
-with tempfile.TemporaryDirectory() as directory:
-    test = Path(directory) / 'motor.c'
-    binary = Path(directory) / 'motor'
-    test.write_text(harness + source[start:end] + r'''
-int main(int argc, char **argv) {
-  assert(argc == 2); fault = atoi(argv[1]);
-  modbusCoilsData[0] = commands[0]; MotorControlTask(NULL);
-}
-''')
-    subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                    '-Wno-unused-parameter', str(test), '-o', str(binary)], check=True)
-    for fault in (0, 1, 2):
-        subprocess.run([str(binary), str(fault)], check=True)
-print('Coil startup, restart, reversal, pause updates, lock failures, and PWM failures passed.')
+def main():
+    with tempfile.TemporaryDirectory() as directory:
+        test = Path(directory) / 'motor.c'
+        binary = Path(directory) / 'motor'
+        test.write_text(harness + source[start:end] + r'''
+    int main(int argc, char **argv) {
+      assert(argc == 2); fault = atoi(argv[1]);
+      modbusCoilsData[0] = commands[0]; MotorControlTask(NULL);
+    }
+    ''')
+        subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-Wno-unused-parameter', str(test), '-o', str(binary)], check=True)
+        for fault in (0, 1, 2):
+            subprocess.run([str(binary), str(fault)], check=True)
+    print('Coil startup, restart, reversal, pause updates, lock failures, and PWM failures passed.')
+
+if __name__ == '__main__':
+    main()

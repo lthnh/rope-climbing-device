@@ -1,0 +1,113 @@
+"""Exercise the real PWM counter and tracking task with mocked HAL/RTOS."""
+from pathlib import Path
+import subprocess
+import tempfile
+
+source = (Path(__file__).resolve().parents[1] / 'Core/Src/main.c').read_text()
+helpers = source[source.index('static void RecordMotionPulse(void)\n{'):
+                 source.index('void MotorControlTask(void *argument)\n{')]
+task = source[source.index('void MotionTrackingTask(void *argument)\n{'):
+              source.index('/* USER CODE END 0 */')]
+harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#define TIM3 3
+#define TIM_FLAG_CC1 1
+#define HAL_TIM_ACTIVE_CHANNEL_1 1
+#define MOTION_TRACK_EN 4
+#define RESET 0
+#define pdTRUE 1
+typedef struct { int Instance, Channel, pending; } TIM_HandleTypeDef;
+static TIM_HandleTypeDef htim3 = {TIM3, HAL_TIM_ACTIVE_CHANNEL_1, 0};
+static volatile bool motionTrackingEnabled, motionMotorRunning;
+static volatile int32_t motionDirection = 1, motionIntervalPulses;
+static volatile uint64_t motionPosition;
+static uint16_t modbusInputRegistersData[6];
+static struct { int ModBusSphrHandle; } modbusHandle;
+static int critical, locked, sample = -1;
+static uint32_t now;
+#define taskENTER_CRITICAL() (++critical)
+#define taskEXIT_CRITICAL() (--critical)
+#define __HAL_TIM_GET_FLAG(timer, flag) ((timer)->pending)
+#define __HAL_TIM_CLEAR_FLAG(timer, flag) ((timer)->pending = 0)
+static uint32_t HAL_GetTick(void) { return now; }
+static uint32_t osKernelGetTickFreq(void) { return 1000; }
+static void osDelay(uint32_t ticks);
+static const int32_t expectedSpeed[] = {100,-20,0,0,0,100,0,-1000,0,-100,0,-100,0};
+static const int64_t expectedPosition[] = {10,5,5,15,25,35,35,-65,-66,-75,-75,-85,-86};
+static uint64_t publishedPosition(void) {
+  uint64_t result = 0;
+  for (int i = 2; i < 6; ++i) result = (result << 16) | modbusInputRegistersData[i];
+  return result;
+}
+static int xSemaphoreTake(int handle, int timeout) {
+  (void)handle; assert(timeout == 0 && !locked && !critical);
+  assert(sample != 8); // A zero-length sample must not publish or discard pulses.
+  if (sample == 3 || sample == 4) {
+    assert(publishedPosition() == 5); return 0;
+  }
+  locked = 1; return pdTRUE;
+}
+static void xSemaphoreGive(int handle) {
+  (void)handle; assert(locked && !critical); locked = 0;
+  uint32_t speed = ((uint32_t)modbusInputRegistersData[0] << 16) | modbusInputRegistersData[1];
+  assert(speed == (uint32_t)expectedSpeed[sample]);
+  assert(publishedPosition() == (uint64_t)expectedPosition[sample]);
+}
+'''
+scenario = r'''
+static void pulses(int count) {
+  while (count--) HAL_TIM_PWM_PulseFinishedCallback(&htim3);
+}
+static void osDelay(uint32_t ticks) {
+  assert(ticks == 100 && !critical && !locked);
+  if (++sample == 13) exit(0);
+  now += 100;
+  switch (sample) {
+    case 0:
+      motionMotorRunning = true; SetMotionTracking(MOTION_TRACK_EN);
+      pulses(9); htim3.pending = 1; break;
+    case 1:
+      now += 150; motionDirection = -1; pulses(5); break;
+    case 2:
+      SetMotionTracking(0); pulses(20); break;
+    case 3:
+      motionDirection = 1; SetMotionTracking(MOTION_TRACK_EN); pulses(10); break;
+    case 4: case 5: pulses(10); break;
+    case 6: motionMotorRunning = false; pulses(10); break;
+    case 7: motionMotorRunning = true; motionDirection = -1; pulses(100); break;
+    case 8: now -= 100; pulses(1); break;
+    case 9: pulses(9); break;
+    case 10: now = UINT32_MAX - 49; break;
+    case 11: assert(now == 50); pulses(10); break;
+    case 12:
+      htim3.pending = 1; SetMotionTracking(0); pulses(10); break;
+  }
+}
+int main(void) {
+  // Channel filtering, stopped/disabled pulses, 64-bit carry and negative position.
+  pulses(10); assert(motionPosition == 0);
+  motionMotorRunning = true; pulses(10); assert(motionPosition == 0);
+  SetMotionTracking(MOTION_TRACK_EN);
+  TIM_HandleTypeDef other = {4, HAL_TIM_ACTIVE_CHANNEL_1, 0};
+  HAL_TIM_PWM_PulseFinishedCallback(&other);
+  other.Instance = TIM3; other.Channel = 2;
+  HAL_TIM_PWM_PulseFinishedCallback(&other); assert(motionPosition == 0);
+  motionPosition = UINT32_MAX; pulses(1); assert(motionPosition == UINT64_C(1) << 32);
+  motionPosition = 0; motionDirection = -1; pulses(1); assert(motionPosition == UINT64_MAX);
+  SetMotionTracking(0); assert(motionPosition == UINT64_MAX);
+  motionPosition = 0; motionIntervalPulses = 0; motionDirection = 1;
+  MotionTrackingTask(NULL);
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    test = Path(directory) / 'motion.c'
+    binary = Path(directory) / 'motion'
+    test.write_text(harness + helpers + task + scenario)
+    subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                    '-Wno-unused-parameter', '-fsanitize=undefined',
+                    str(test), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+print('Pulse gating, signed position/rate, pending edges, timing, lock failures, and register encoding passed.')

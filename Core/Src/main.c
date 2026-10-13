@@ -46,9 +46,9 @@
 /* USER CODE BEGIN PD */
 #define CW_PIN           GPIO_PIN_10   // Both are from bank B
 #define EN_PIN           GPIO_PIN_11
-#define MOTOR_STEP_ANGLE 1.8f
 #define MOTOR_EN         (1u << 0u)    // Coil 0
 #define MOTOR_CW         (1u << 1u)    // Coil 1
+#define MOTION_TRACK_EN  (1u << 2u)    // Coil 2
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -77,10 +77,23 @@ const osThreadAttr_t motorControlTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 
+osThreadId_t motionTrackingTaskHandle;
+const osThreadAttr_t motionTrackingTask_attributes = {
+  .name = "motionTrackingTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+static volatile bool motionTrackingEnabled;
+static volatile bool motionMotorRunning;
+static volatile int32_t motionDirection = 1;
+static volatile uint64_t motionPosition; // Unsigned storage preserves two's-complement wrap.
+static volatile int32_t motionIntervalPulses;
+
 modbusHandler_t modbusHandle;
 uint16_t modbusCoilsData[1];            // 16 coils, Modbus addresses 0-15
 uint16_t modbusDiscreteInputsData[1];   // 16 discrete inputs, Modbus addresses 100-115
-uint16_t modbusInputRegistersData[2];   // 2 input registers, Modbus address 200-201
+uint16_t modbusInputRegistersData[6];   // Speed 200-201, position 202-205
 uint16_t modbusHoldingRegistersData[2]; // 2 holding registers, Modbus address 300-301
 
 /* USER CODE END PV */
@@ -94,6 +107,7 @@ void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 void MotorControlTask(void *argument);
+void MotionTrackingTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -121,7 +135,7 @@ void ModbusComm_Init(void)
   // Coils — FC1, FC5, FC15
   // 0th coil is EN for motor
   // 1st coil is CW for motor
-  // 2nd coil is EN for speed monitoring
+  // 2nd coil enables pulse speed/position tracking
   modbusHandle.u16coils            = modbusCoilsData;
   modbusHandle.u16coilsStartAdd    = 0;
   modbusHandle.u16coilsNregs       = 1;
@@ -134,7 +148,7 @@ void ModbusComm_Init(void)
   // Input Registers — FC4
   modbusHandle.u16inputRegs          = modbusInputRegistersData;
   modbusHandle.u16inputRegsStartAdd  = 200;
-  modbusHandle.u16inputRegsNregs     = 2;
+  modbusHandle.u16inputRegsNregs     = 6;
 
   // Holding Registers — FC3, FC6, FC16
   modbusHandle.u16holdingRegs          = modbusHoldingRegistersData;
@@ -143,6 +157,41 @@ void ModbusComm_Init(void)
 
   ModbusInit(&modbusHandle);
   ModbusStart(&modbusHandle);
+}
+
+static void RecordMotionPulse(void)
+{
+  if (motionMotorRunning && motionTrackingEnabled)
+  {
+    motionPosition += motionDirection;
+    motionIntervalPulses += motionDirection;
+  }
+}
+
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM3 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+  {
+    RecordMotionPulse();
+  }
+}
+
+// Called with TIM3 masked: account for an edge awaiting interrupt service.
+static void FlushMotionPulse(void)
+{
+  if (__HAL_TIM_GET_FLAG(&htim3, TIM_FLAG_CC1) != RESET)
+  {
+    __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_CC1);
+    RecordMotionPulse();
+  }
+}
+
+static void SetMotionTracking(uint16_t coils)
+{
+  taskENTER_CRITICAL();
+  FlushMotionPulse();
+  motionTrackingEnabled = (coils & MOTION_TRACK_EN) != 0;
+  taskEXIT_CRITICAL();
 }
 
 void MotorControlTask(void *argument)
@@ -155,19 +204,25 @@ void MotorControlTask(void *argument)
   {
     if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
     {
-      uint16_t command = modbusCoilsData[0] & commandMask;
+      uint16_t coils = modbusCoilsData[0];
+      uint16_t command = coils & commandMask;
       xSemaphoreGive(modbusHandle.ModBusSphrHandle);
 
+      SetMotionTracking(coils);
       bool enabled = READ_BIT(command, MOTOR_EN);
       GPIO_PinState requestedDirection = READ_BIT(command, MOTOR_CW) ? GPIO_PIN_RESET : GPIO_PIN_SET;
 
       if (running && (!enabled || requestedDirection != direction))
       {
+        taskENTER_CRITICAL();
         HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
-        if (HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1) != HAL_OK)
+        if (HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
         {
           Error_Handler(__FILE__, __LINE__);
         }
+        FlushMotionPulse();
+        motionMotorRunning = false;
+        taskEXIT_CRITICAL();
         running = false;
       }
 
@@ -178,15 +233,24 @@ void MotorControlTask(void *argument)
         // Re-read after the pause without blocking Modbus writes during it.
         if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
         {
-          uint16_t latestCommand = modbusCoilsData[0] & commandMask;
+          uint16_t latestCoils = modbusCoilsData[0];
+          uint16_t latestCommand = latestCoils & commandMask;
           xSemaphoreGive(modbusHandle.ModBusSphrHandle);
+          SetMotionTracking(latestCoils);
           if (latestCommand == command)
           {
-            if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1) != HAL_OK)
+            taskENTER_CRITICAL();
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_CC1);
+            HAL_NVIC_ClearPendingIRQ(TIM3_IRQn);
+            motionDirection = requestedDirection == GPIO_PIN_SET ? 1 : -1;
+            if (HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
             {
               Error_Handler(__FILE__, __LINE__);
             }
             HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
+            motionMotorRunning = true;
+            taskEXIT_CRITICAL();
             direction = requestedDirection;
             running = true;
           }
@@ -194,6 +258,45 @@ void MotorControlTask(void *argument)
       }
     }
     osDelay(10);
+  }
+}
+
+void MotionTrackingTask(void *argument)
+{
+  uint32_t previousTime = HAL_GetTick();
+  const uint32_t period = osKernelGetTickFreq() / 10;
+  while (true)
+  {
+    osDelay(period);
+    taskENTER_CRITICAL();
+    FlushMotionPulse();
+    uint32_t now = HAL_GetTick();
+    uint32_t elapsed = now - previousTime;
+    uint64_t position = motionPosition;
+    int32_t pulses = motionIntervalPulses;
+    bool active = motionTrackingEnabled && motionMotorRunning;
+    if (elapsed != 0)
+    {
+      motionIntervalPulses = 0;
+    }
+    taskEXIT_CRITICAL();
+    if (elapsed == 0)
+    {
+      continue;
+    }
+    previousTime = now;
+    // shortcut: fixed 100 Hz PWM keeps this signed rate in range; revisit if frequency changes.
+    int32_t speed = active ? (int32_t)((int64_t)pulses * 1000 / elapsed) : 0;
+    if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
+    {
+      modbusInputRegistersData[0] = (uint32_t)speed >> 16;
+      modbusInputRegistersData[1] = (uint32_t)speed;
+      for (unsigned int i = 0; i < 4; ++i)
+      {
+        modbusInputRegistersData[2 + i] = position >> (48 - 16 * i);
+      }
+      xSemaphoreGive(modbusHandle.ModBusSphrHandle);
+    }
   }
 }
 /* USER CODE END 0 */
@@ -260,6 +363,11 @@ int main(void)
   /* add threads, ... */
   motorControlTaskHandle = osThreadNew(MotorControlTask, NULL, &motorControlTask_attributes);
   if (!motorControlTaskHandle)
+  {
+    Error_Handler(__FILE__, __LINE__);
+  }
+  motionTrackingTaskHandle = osThreadNew(MotionTrackingTask, NULL, &motionTrackingTask_attributes);
+  if (!motionTrackingTaskHandle)
   {
     Error_Handler(__FILE__, __LINE__);
   }
@@ -365,7 +473,8 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler(__FILE__, __LINE__);
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  // PWM2 compare is the rising STEP edge, so the callback counts emitted pulses.
+  sConfigOC.OCMode = TIM_OCMODE_PWM2;
   sConfigOC.Pulse = 50;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -502,7 +611,7 @@ void Error_Handler(const char *file, int line)
   __disable_irq();
   printf("Error occured at %s, line %d\n", file, line);
   HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
-  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1);
   while (1)
   {
   }
