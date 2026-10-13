@@ -25,10 +25,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
-
+#include <stddef.h>
 #include "stm32f103xb.h"
-#include "stm32f1xx_hal_gpio.h"
+#include "stm32f1xx.h"
+#include "stm32f1xx_hal_def.h"
 #include "stm32f1xx_hal_tim.h"
+#include "stm32f1xx_hal_gpio.h"
+#include "projdefs.h"
+#include "semphr.h"
 
 #include "Modbus.h"
 /* USER CODE END Includes */
@@ -40,8 +44,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define CW_PIN GPIO_PIN_10 // Both are from bank B
-#define EN_PIN GPIO_PIN_11
+#define CW_PIN           GPIO_PIN_10   // Both are from bank B
+#define EN_PIN           GPIO_PIN_11
+#define MOTOR_STEP_ANGLE 1.8f
+#define MOTOR_EN         (1u << 0u)    // Coil 0
+#define MOTOR_CW         (1u << 1u)    // Coil 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,22 +69,20 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
-osThreadId_t modbusCommTaskHandle;
 osThreadId_t motorControlTaskHandle;
 
-const osThreadAttr_t modbusCommTask_attributes = {
-  .name = "modbusCommTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
 const osThreadAttr_t motorControlTask_attributes = {
   .name = "motorControlTask",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
-modbusHandler_t modbusHandler;
-uint16_t modbusData[8];
+modbusHandler_t modbusHandle;
+uint16_t modbusCoilsData[1];            // 16 coils, Modbus addresses 0-15
+uint16_t modbusDiscreteInputsData[1];   // 16 discrete inputs, Modbus addresses 100-115
+uint16_t modbusInputRegistersData[2];   // 2 input registers, Modbus address 200-201
+uint16_t modbusHoldingRegistersData[2]; // 2 holding registers, Modbus address 300-301
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -88,7 +93,6 @@ static void MX_USART1_UART_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-void ModbusCommTask(void *argument);
 void MotorControlTask(void *argument);
 /* USER CODE END PFP */
 
@@ -103,33 +107,93 @@ int _write(int file, char *ptr, int len)
     return len;
 }
 
-void Modbus_Comm_Init()
+void ModbusComm_Init(void)
 {
-  modbusHandler.uModbusType = MB_SLAVE;
-  modbusHandler.port = &huart1;
-  modbusHandler.u8id = 17;
-  modbusHandler.u16timeOut = 1000;
-  modbusHandler.EN_Port = NULL;
-  modbusHandler.u16regs = modbusData;
-  modbusHandler.u16regsize = sizeof(modbusData)/sizeof(modbusData[0]);
-  modbusHandler.xTypeHW = USART_HW;
+  modbusHandle.uModbusType = MB_SLAVE;
+  modbusHandle.port = &huart1;
+  modbusHandle.u8id = 17;
+  modbusHandle.u16timeOut = 1000;
+  modbusHandle.EN_Port = NULL;
+  modbusHandle.u16regs = NULL;
+  modbusHandle.u16regsize = 0;
+  modbusHandle.xTypeHW = USART_HW;
 
-  ModbusInit(&modbusHandler);
-}
+  // Coils — FC1, FC5, FC15
+  // 0th coil is EN for motor
+  // 1st coil is CW for motor
+  // 2nd coil is EN for speed monitoring
+  modbusHandle.u16coils            = modbusCoilsData;
+  modbusHandle.u16coilsStartAdd    = 0;
+  modbusHandle.u16coilsNregs       = 1;
 
-void ModbusCommTask(void *argument)
-{
-  ModbusStart(&modbusHandler);
+  // Discrete Inputs — FC2
+  modbusHandle.u16discreteInputs          = modbusDiscreteInputsData;
+  modbusHandle.u16discreteInputsStartAdd  = 100;
+  modbusHandle.u16discreteInputsNregs     = 1;
+
+  // Input Registers — FC4
+  modbusHandle.u16inputRegs          = modbusInputRegistersData;
+  modbusHandle.u16inputRegsStartAdd  = 200;
+  modbusHandle.u16inputRegsNregs     = 2;
+
+  // Holding Registers — FC3, FC6, FC16
+  modbusHandle.u16holdingRegs          = modbusHoldingRegistersData;
+  modbusHandle.u16holdingRegsStartAdd  = 300;
+  modbusHandle.u16holdingRegsNregs     = 2;
+
+  ModbusInit(&modbusHandle);
+  ModbusStart(&modbusHandle);
 }
 
 void MotorControlTask(void *argument)
 {
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  const uint16_t commandMask = MOTOR_EN | MOTOR_CW;
+  bool running = false;
+  GPIO_PinState direction = GPIO_PIN_RESET;
 
   while (true)
   {
-    HAL_GPIO_WritePin(GPIOB, CW_PIN, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
+    if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
+    {
+      uint16_t command = modbusCoilsData[0] & commandMask;
+      xSemaphoreGive(modbusHandle.ModBusSphrHandle);
+
+      bool enabled = READ_BIT(command, MOTOR_EN);
+      GPIO_PinState requestedDirection = READ_BIT(command, MOTOR_CW) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+
+      if (running && (!enabled || requestedDirection != direction))
+      {
+        HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
+        if (HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1) != HAL_OK)
+        {
+          Error_Handler(__FILE__, __LINE__);
+        }
+        running = false;
+      }
+
+      if (enabled && !running)
+      {
+        HAL_GPIO_WritePin(GPIOB, CW_PIN, requestedDirection);
+        osDelay(10);
+        // Re-read after the pause without blocking Modbus writes during it.
+        if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
+        {
+          uint16_t latestCommand = modbusCoilsData[0] & commandMask;
+          xSemaphoreGive(modbusHandle.ModBusSphrHandle);
+          if (latestCommand == command)
+          {
+            if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1) != HAL_OK)
+            {
+              Error_Handler(__FILE__, __LINE__);
+            }
+            HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
+            direction = requestedDirection;
+            running = true;
+          }
+        }
+      }
+    }
+    osDelay(10);
   }
 }
 /* USER CODE END 0 */
@@ -166,7 +230,7 @@ int main(void)
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  Modbus_Comm_Init();
+  ModbusComm_Init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -194,9 +258,11 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  modbusCommTaskHandle = osThreadNew(ModbusCommTask, NULL, &modbusCommTask_attributes);
-
   motorControlTaskHandle = osThreadNew(MotorControlTask, NULL, &motorControlTask_attributes);
+  if (!motorControlTaskHandle)
+  {
+    Error_Handler(__FILE__, __LINE__);
+  }
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -237,7 +303,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
@@ -251,7 +317,7 @@ void SystemClock_Config(void)
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
 }
 
@@ -282,22 +348,22 @@ static void MX_TIM3_Init(void)
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
   if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
   if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 50;
@@ -305,7 +371,7 @@ static void MX_TIM3_Init(void)
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
   /* USER CODE BEGIN TIM3_Init 2 */
 
@@ -339,7 +405,7 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   if (HAL_UART_Init(&huart1) != HAL_OK)
   {
-    Error_Handler();
+    Error_Handler(__FILE__, __LINE__);
   }
   /* USER CODE BEGIN USART1_Init 2 */
 
@@ -364,7 +430,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10|GPIO_PIN_11, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : PB10 PB11 */
   GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
@@ -426,11 +495,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
-void Error_Handler(void)
+void Error_Handler(const char *file, int line)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
+  printf("Error occured at %s, line %d\n", file, line);
+  HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
   while (1)
   {
   }
