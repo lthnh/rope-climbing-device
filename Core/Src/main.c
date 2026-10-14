@@ -49,6 +49,7 @@
 #define MOTOR_EN         (1u << 0u)    // Coil 0
 #define MOTOR_CW         (1u << 1u)    // Coil 1
 #define MOTION_TRACK_EN  (1u << 2u)    // Coil 2
+#define MOTION_ZERO      (1u << 3u)    // Coil 3
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -136,6 +137,7 @@ void ModbusComm_Init(void)
   // 0th coil is EN for motor
   // 1st coil is CW for motor
   // 2nd coil enables pulse speed/position tracking
+  // 3rd coil requests zeroing; cleared after completion
   modbusHandle.u16coils            = modbusCoilsData;
   modbusHandle.u16coilsStartAdd    = 0;
   modbusHandle.u16coilsNregs       = 1;
@@ -289,12 +291,25 @@ void MotionTrackingTask(void *argument)
     int32_t speed = active ? (int32_t)((int64_t)pulses * 1000 / elapsed) : 0;
     if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
     {
+      if (modbusCoilsData[0] & MOTION_ZERO)
+      {
+        taskENTER_CRITICAL();
+        // Discard all pulses through the reset boundary, including a pending edge.
+        FlushMotionPulse();
+        motionPosition = 0;
+        motionIntervalPulses = 0;
+        previousTime = HAL_GetTick();
+        taskEXIT_CRITICAL();
+        position = 0;
+        speed = 0;
+      }
       modbusInputRegistersData[0] = (uint32_t)speed >> 16;
       modbusInputRegistersData[1] = (uint32_t)speed;
       for (unsigned int i = 0; i < 4; ++i)
       {
         modbusInputRegistersData[2 + i] = position >> (48 - 16 * i);
       }
+      modbusCoilsData[0] &= ~MOTION_ZERO;
       xSemaphoreGive(modbusHandle.ModBusSphrHandle);
     }
   }

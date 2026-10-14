@@ -7,12 +7,15 @@ The Delta HMI is the Modbus RTU master. Configure slave **17**, **9600 baud, 8 d
 | Motor enable (coil) | 0 | 01 read, 05/15 write | 0 stop, 1 run |
 | Motor direction (coil) | 1 | 01 read, 05/15 write | 0 forward, 1 backward |
 | Motion tracking enable (coil) | 2 | 01 read, 05/15 write | 0 pause tracking, 1 track |
+| Zero motion estimates (coil) | 3 | 01 read, 05/15 write | Write 1 to zero; firmware clears to 0 on completion |
 | Discrete inputs | 100–115 | 02 read | Reserved; initially zero |
 | Estimated speed | 200–201 | 04 read | Signed 32-bit pulses/second |
-| Estimated position | 202–205 | 04 read | Signed 64-bit pulse position from boot |
+| Estimated position | 202–205 | 04 read | Signed 64-bit pulse position from boot or last zero |
 | Holding registers | 300–301 | 03 read, 06/16 write | Separate storage; does not control the motor |
 
-Set direction coil 1, then enable coil 0. Stop by clearing coil 0. FC15 can update both coils together. Coil 2 enables pulse speed/position tracking and does not affect motor control. Both directions count while enabled: forward adds, backward subtracts. Disabling tracking retains position, ignores further travel, and reports zero speed. Re-enabling resumes from that retained position; movement during the pause is lost. Position starts at zero on boot, with no persistence or reset command.
+Set direction coil 1, then enable coil 0. Stop by clearing coil 0. FC15 can update both coils together. Coil 2 enables pulse speed/position tracking and does not affect motor control. Both directions count while enabled: forward adds, backward subtracts. Disabling tracking retains position, ignores further travel, and reports zero speed. Re-enabling resumes from that retained position; movement during the pause is lost. Position starts at zero on boot, with no persistence.
+
+Set coil 3 to 1 to zero the pulse position and speed. The tracking task resets its counters and speed sampling baseline, publishes zeros to registers 200–205, then clears only coil 3 under the same Modbus semaphore. Read coil 3 returning to 0 as completion acknowledgement. The request works while tracking is paused or the motor is stopped. While moving, tracking resumes immediately from zero and the next sample can be nonzero; zeroing does not stop the motor. Normally completion takes up to 100 ms; semaphore contention leaves the request pending until a successful acquisition.
 
 `MotorControlTask` copies the coil word while holding the Modbus semaphore, then releases it before controlling GPIO/PWM or delaying. It polls every 10 RTOS ticks. Starting and reversing wait 10 ticks after setting direction, then re-read the enable/direction bits before starting PWM. A changed command or failed semaphore acquisition during this recheck leaves the motor disabled until a later poll. If the initial read fails while running, the current motion continues until a successful read.
 

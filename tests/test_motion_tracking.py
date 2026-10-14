@@ -17,6 +17,7 @@ harness = r'''
 #define TIM_FLAG_CC1 1
 #define HAL_TIM_ACTIVE_CHANNEL_1 1
 #define MOTION_TRACK_EN 4
+#define MOTION_ZERO 8
 #define RESET 0
 #define pdTRUE 1
 typedef struct { int Instance, Channel, pending; } TIM_HandleTypeDef;
@@ -25,6 +26,7 @@ static volatile bool motionTrackingEnabled, motionMotorRunning;
 static volatile int32_t motionDirection = 1, motionIntervalPulses;
 static volatile uint64_t motionPosition;
 static uint16_t modbusInputRegistersData[6];
+static uint16_t modbusCoilsData[1];
 static struct { int ModBusSphrHandle; } modbusHandle;
 static int critical, locked, sample = -1;
 static uint32_t now;
@@ -35,8 +37,8 @@ static uint32_t now;
 static uint32_t HAL_GetTick(void) { return now; }
 static uint32_t osKernelGetTickFreq(void) { return 1000; }
 static void osDelay(uint32_t ticks);
-static const int32_t expectedSpeed[] = {100,-20,0,0,0,100,0,-1000,0,-100,0,-100,0};
-static const int64_t expectedPosition[] = {10,5,5,15,25,35,35,-65,-66,-75,-75,-85,-86};
+static const int32_t expectedSpeed[] = {100,-20,0,0,0,100,0,-1000,0,-100,0,-100,0,0,50,0,100,0,0,100,0};
+static const int64_t expectedPosition[] = {10,5,5,15,25,35,35,-65,-66,-75,-75,-85,-86,0,5,0,10,20,0,10,0};
 static uint64_t publishedPosition(void) {
   uint64_t result = 0;
   for (int i = 2; i < 6; ++i) result = (result << 16) | modbusInputRegistersData[i];
@@ -45,8 +47,10 @@ static uint64_t publishedPosition(void) {
 static int xSemaphoreTake(int handle, int timeout) {
   (void)handle; assert(timeout == 0 && !locked && !critical);
   assert(sample != 8); // A zero-length sample must not publish or discard pulses.
-  if (sample == 3 || sample == 4) {
-    assert(publishedPosition() == 5); return 0;
+  if (sample == 3 || sample == 4 || sample == 17) {
+    assert(publishedPosition() == (sample == 17 ? 10 : 5));
+    if (sample == 17) assert(modbusCoilsData[0] & MOTION_ZERO);
+    return 0;
   }
   locked = 1; return pdTRUE;
 }
@@ -55,6 +59,11 @@ static void xSemaphoreGive(int handle) {
   uint32_t speed = ((uint32_t)modbusInputRegistersData[0] << 16) | modbusInputRegistersData[1];
   assert(speed == (uint32_t)expectedSpeed[sample]);
   assert(publishedPosition() == (uint64_t)expectedPosition[sample]);
+  assert(!(modbusCoilsData[0] & MOTION_ZERO));
+  if (sample >= 13) assert(modbusCoilsData[0] == (sample < 14 || sample == 20 ? 0x8003 : 0x8007));
+  if (sample == 13 || sample == 15 || sample == 18 || sample == 20) {
+    assert(motionPosition == 0 && motionIntervalPulses == 0 && !htim3.pending);
+  }
 }
 '''
 scenario = r'''
@@ -63,7 +72,7 @@ static void pulses(int count) {
 }
 static void osDelay(uint32_t ticks) {
   assert(ticks == 100 && !critical && !locked);
-  if (++sample == 13) exit(0);
+  if (++sample == 21) exit(0);
   now += 100;
   switch (sample) {
     case 0:
@@ -84,6 +93,18 @@ static void osDelay(uint32_t ticks) {
     case 11: assert(now == 50); pulses(10); break;
     case 12:
       htim3.pending = 1; SetMotionTracking(0); pulses(10); break;
+    case 13: modbusCoilsData[0] = 0x8003 | MOTION_ZERO; break;
+    case 14:
+      modbusCoilsData[0] = 0x8007; SetMotionTracking(MOTION_TRACK_EN);
+      motionDirection = 1; pulses(5); break;
+    case 15:
+      pulses(5); htim3.pending = 1; modbusCoilsData[0] |= MOTION_ZERO; break;
+    case 16: case 19: pulses(10); break;
+    case 17: pulses(10); modbusCoilsData[0] |= MOTION_ZERO; break;
+    case 18: pulses(9); htim3.pending = 1; break;
+    case 20:
+      motionMotorRunning = false; SetMotionTracking(0);
+      modbusCoilsData[0] = 0x8003 | MOTION_ZERO; break;
   }
 }
 int main(void) {
@@ -110,4 +131,4 @@ with tempfile.TemporaryDirectory() as directory:
                     '-Wno-unused-parameter', '-fsanitize=undefined',
                     str(test), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print('Pulse gating, signed position/rate, pending edges, timing, lock failures, and register encoding passed.')
+print('Pulse tracking, timing, register encoding, and zeroing with acknowledgement/lock contention passed.')
