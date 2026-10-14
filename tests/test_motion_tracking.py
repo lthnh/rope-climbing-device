@@ -8,6 +8,7 @@ helpers = source[source.index('static void RecordMotionPulse(void)\n{'):
                  source.index('void MotorControlTask(void *argument)\n{')]
 task = source[source.index('void MotionTrackingTask(void *argument)\n{'):
               source.index('/* USER CODE END 0 */')]
+calibration = source[source.index('#define WHEEL_RADIUS_MM'):source.index('/* USER CODE END PD */')]
 harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -37,8 +38,8 @@ static uint32_t now;
 static uint32_t HAL_GetTick(void) { return now; }
 static uint32_t osKernelGetTickFreq(void) { return 1000; }
 static void osDelay(uint32_t ticks);
-static const int32_t expectedSpeed[] = {100,-20,0,0,0,100,0,-1000,0,-100,0,-100,0,0,50,0,100,0,0,100,0};
-static const int64_t expectedPosition[] = {10,5,5,15,25,35,35,-65,-66,-75,-75,-85,-86,0,5,0,10,20,0,10,0};
+static const int32_t expectedSpeed[] = {70685,-14137,0,0,0,70685,0,-706858,0,-70685,0,-70685,0,0,35342,0,70685,0,0,70685,0,1413716,-1413716,0,0};
+static const int64_t expectedPosition[] = {7068,3534,3534,10602,17671,24740,24740,-45945,-46652,-53014,-53014,-60082,-60789,0,3534,0,7068,14137,0,7068,0,141371,0,INT64_MAX,INT64_MIN};
 static uint64_t publishedPosition(void) {
   uint64_t result = 0;
   for (int i = 2; i < 6; ++i) result = (result << 16) | modbusInputRegistersData[i];
@@ -48,7 +49,7 @@ static int xSemaphoreTake(int handle, int timeout) {
   (void)handle; assert(timeout == 0 && !locked && !critical);
   assert(sample != 8); // A zero-length sample must not publish or discard pulses.
   if (sample == 3 || sample == 4 || sample == 17) {
-    assert(publishedPosition() == (sample == 17 ? 10 : 5));
+    assert(publishedPosition() == (sample == 17 ? 7068 : 3534));
     if (sample == 17) assert(modbusCoilsData[0] & MOTION_ZERO);
     return 0;
   }
@@ -72,7 +73,7 @@ static void pulses(int count) {
 }
 static void osDelay(uint32_t ticks) {
   assert(ticks == 100 && !critical && !locked);
-  if (++sample == 21) exit(0);
+  if (++sample == 25) exit(0);
   now += 100;
   switch (sample) {
     case 0:
@@ -105,6 +106,12 @@ static void osDelay(uint32_t ticks) {
     case 20:
       motionMotorRunning = false; SetMotionTracking(0);
       modbusCoilsData[0] = 0x8003 | MOTION_ZERO; break;
+    case 21:
+      motionMotorRunning = true; SetMotionTracking(MOTION_TRACK_EN);
+      modbusCoilsData[0] = 0x8007; pulses(200); break;
+    case 22: motionDirection = -1; pulses(200); break;
+    case 23: motionPosition = INT64_MAX; break;
+    case 24: motionPosition = UINT64_C(1) << 63; break;
   }
 }
 int main(void) {
@@ -126,9 +133,9 @@ int main(void) {
 with tempfile.TemporaryDirectory() as directory:
     test = Path(directory) / 'motion.c'
     binary = Path(directory) / 'motion'
-    test.write_text(harness + helpers + task + scenario)
+    test.write_text(calibration + harness + helpers + task + scenario)
     subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-Wno-unused-parameter', '-fsanitize=undefined',
                     str(test), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print('Pulse tracking, timing, register encoding, and zeroing with acknowledgement/lock contention passed.')
+print('Wheel conversion, signed distance/speed, saturation, pulse tracking, and zeroing passed.')

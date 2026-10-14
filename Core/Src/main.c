@@ -50,6 +50,12 @@
 #define MOTOR_CW         (1u << 1u)    // Coil 1
 #define MOTION_TRACK_EN  (1u << 2u)    // Coil 2
 #define MOTION_ZERO      (1u << 3u)    // Coil 3
+#define WHEEL_RADIUS_MM 22.5
+// shortcut: full stepping and 1:1 gearing assumed; update these after driver/gear calibration.
+#define MOTOR_PULSES_PER_REV 200.0
+#define MOTOR_REVS_PER_WHEEL_REV 1.0
+#define MOTION_UM_PER_PULSE (2.0 * 3.141592653589793 * WHEEL_RADIUS_MM * 1000.0 / \
+                             (MOTOR_PULSES_PER_REV * MOTOR_REVS_PER_WHEEL_REV))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -94,7 +100,7 @@ static volatile int32_t motionIntervalPulses;
 modbusHandler_t modbusHandle;
 uint16_t modbusCoilsData[1];            // 16 coils, Modbus addresses 0-15
 uint16_t modbusDiscreteInputsData[1];   // 16 discrete inputs, Modbus addresses 100-115
-uint16_t modbusInputRegistersData[6];   // Speed 200-201, position 202-205
+uint16_t modbusInputRegistersData[6];   // Speed um/s 200-201, position um 202-205
 uint16_t modbusHoldingRegistersData[2]; // 2 holding registers, Modbus address 300-301
 
 /* USER CODE END PV */
@@ -287,8 +293,12 @@ void MotionTrackingTask(void *argument)
       continue;
     }
     previousTime = now;
-    // shortcut: fixed 100 Hz PWM keeps this signed rate in range; revisit if frequency changes.
-    int32_t speed = active ? (int32_t)((int64_t)pulses * 1000 / elapsed) : 0;
+    // shortcut: current calibration and 100 Hz PWM fit int32 speed; revisit if either changes.
+    int32_t speed = active ? (int32_t)(pulses * MOTION_UM_PER_PULSE * 1000.0 / elapsed) : 0;
+    double distanceUm = (int64_t)position * MOTION_UM_PER_PULSE;
+    // Saturate physical distance rather than overflowing the signed Modbus value.
+    int64_t distance = distanceUm >= (double)INT64_MAX ? INT64_MAX :
+                       distanceUm <= (double)INT64_MIN ? INT64_MIN : (int64_t)distanceUm;
     if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
     {
       if (modbusCoilsData[0] & MOTION_ZERO)
@@ -300,14 +310,14 @@ void MotionTrackingTask(void *argument)
         motionIntervalPulses = 0;
         previousTime = HAL_GetTick();
         taskEXIT_CRITICAL();
-        position = 0;
+        distance = 0;
         speed = 0;
       }
       modbusInputRegistersData[0] = (uint32_t)speed >> 16;
       modbusInputRegistersData[1] = (uint32_t)speed;
       for (unsigned int i = 0; i < 4; ++i)
       {
-        modbusInputRegistersData[2 + i] = position >> (48 - 16 * i);
+        modbusInputRegistersData[2 + i] = (uint64_t)distance >> (48 - 16 * i);
       }
       modbusCoilsData[0] &= ~MOTION_ZERO;
       xSemaphoreGive(modbusHandle.ModBusSphrHandle);
