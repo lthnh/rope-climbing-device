@@ -26,12 +26,21 @@ harness = r'''
 #define GPIO_PIN_RESET 0
 #define GPIO_PIN_SET 1
 #define TIM_CHANNEL_1 1
+#define TIM_EVENTSOURCE_UPDATE 1
 #define HAL_OK 0
 #define pdTRUE 1
 typedef int GPIO_PinState;
 typedef struct { int Instance, Channel, counter, pending; } TIM_HandleTypeDef;
 static TIM_HandleTypeDef htim3 = {.Instance = TIM3};
 static int enabled, direction, pwm, step, locked, pause, reads, fault, critical;
+static int prescaler;
+static const uint16_t frequencies[] = {100,100,700,700,1,100,100,100,100,100,100,100,65535};
+static uint16_t modbusHoldingRegistersData[2] = {100,0};
+static uint32_t HAL_RCC_GetPCLK1Freq(void) { return 8000000; }
+#define __HAL_TIM_SET_PRESCALER(timer, value) (prescaler = (value))
+static int HAL_TIM_GenerateEvent(TIM_HandleTypeDef *timer, int event) {
+  (void)timer; (void)event; assert(critical && !pwm && !enabled); return HAL_OK;
+}
 static volatile bool motionTrackingEnabled, motionMotorRunning;
 static volatile int32_t motionDirection = 1, motionIntervalPulses;
 static volatile uint64_t motionPosition;
@@ -62,6 +71,7 @@ static int HAL_TIM_PWM_Start_IT(TIM_HandleTypeDef *timer, int channel) {
   (void)timer; (void)channel; assert(!locked && !enabled && !pwm);
   if (fault == 1) return 1;
   assert(critical && !timer->pending && timer->counter == 0);
+  assert(prescaler == ((step == 2 || step == 12) ? 113 : 799));
   pwm = 1; return HAL_OK;
 }
 static int HAL_TIM_PWM_Stop_IT(TIM_HandleTypeDef *timer, int channel) {
@@ -77,7 +87,12 @@ static void osDelay(int ticks) {
     pause = 0; assert(!enabled && !pwm);
     if (step == 3) modbusCoilsData[0] = 0;
     if (step == 6) modbusCoilsData[0] = 1;
+    if (step == 11) modbusHoldingRegistersData[0] = 200;
+    if (fault == 3 && step == 1) modbusHoldingRegistersData[0] = 700;
     return;
+  }
+  if (fault == 3 && step == 1) {
+    assert(!enabled && !pwm && !motionMotorRunning); exit(0);
   }
   const int running[] = {0,1,1,0,1,0,0,1,1,1,0,0,1};
   const int directions[] = {0,1,1,0,0,0,0,1,1,1,1,1,1};
@@ -96,6 +111,7 @@ static void osDelay(int ticks) {
   }
   if (++step == 13) { assert(!fault); exit(0); }
   reads = 0; modbusCoilsData[0] = commands[step];
+  modbusHoldingRegistersData[0] = frequencies[step];
 }
 '''
 def main():
@@ -110,9 +126,9 @@ def main():
     ''')
         subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                         '-Wno-unused-parameter', str(test), '-o', str(binary)], check=True)
-        for fault in (0, 1, 2):
+        for fault in (0, 1, 2, 3):
             subprocess.run([str(binary), str(fault)], check=True)
-    print('Coil startup, restart, reversal, pause updates, lock failures, and PWM failures passed.')
+    print('Coil control, frequency changes/clamping, pause updates, lock failures, and PWM failures passed.')
 
 if __name__ == '__main__':
     main()

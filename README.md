@@ -2,6 +2,8 @@
 
 The Delta HMI is the Modbus RTU master. Configure slave **17**, **9600 baud, 8 data bits, even parity, 1 stop bit (8E1)** on USART1 (PA9 TX, PA10 RX). The STM32 uses a 9-bit UART word length because parity occupies one bit.
 
+USART1 interrupts must be enabled at priority 5 and dispatched through `USART1_IRQHandler()` to `HAL_UART_IRQHandler(&huart1)` for Modbus RX/TX callbacks to run. The CubeMX configuration includes this interrupt. Modbus initialization creates RTOS objects after `osKernelInitialize()` and before the motor task. If enabling from the HMI still fails, watch `modbusHandle.u16InCnt` for received frames, `modbusHandle.u16OutCnt` for replies, `huart1.ErrorCode` for UART errors, and bit 0 of `modbusCoilsData[0]` for the enable command. A set enable bit with no motion points to the GPIO/PWM/driver path rather than the HMI command binding.
+
 | Data | Zero-based wire address | Function codes | Meaning |
 | --- | --- | --- | --- |
 | Motor enable (coil) | 0 | 01 read, 05/15 write | 0 stop, 1 run |
@@ -11,15 +13,18 @@ The Delta HMI is the Modbus RTU master. Configure slave **17**, **9600 baud, 8 d
 | Discrete inputs | 100–115 | 02 read | Reserved; initially zero |
 | Estimated speed | 200–201 | 04 read | Signed 32-bit mm/s × 1000 (µm/s) |
 | Estimated position | 202–205 | 04 read | Signed 64-bit mm × 1000 (µm), from boot or last zero |
-| Holding registers | 300–301 | 03 read, 06/16 write | Separate storage; does not control the motor |
+| PWM frequency | 300 | 03 read, 06/16 write | Hz, default 100; commands clamped to 100–700 |
+| Reserved holding register | 301 | 03 read, 06/16 write | Separate storage |
 
 Set direction coil 1, then enable coil 0. Stop by clearing coil 0. FC15 can update both coils together. Coil 2 enables pulse speed/position tracking and does not affect motor control. Both directions count while enabled: forward adds, backward subtracts. Disabling tracking retains position, ignores further travel, and reports zero speed. Re-enabling resumes from that retained position; movement during the pause is lost. Position starts at zero on boot, with no persistence.
 
+`MotorControlHMI.dpa` uses Delta's RTU Hex Address driver: telemetry must use **R-C8** (speed, decimal address 200) and **R-CA** (position, decimal address 202), with signed values, high words first, and three decimal places. `RW-` selects holding registers (FC3), so using it for telemetry causes an illegal-address response. Buttons use **RWB-0** through **RWB-3** for the four control coils. The slider writes **RW-12C** (holding register 300); it sets PWM frequency in Hz. Run `python3 tests/test_hmi_config.py` to check the packed HMI bindings. Open, compile, and download the updated project with DOPSoft to apply it to the panel.
+
 Set coil 3 to 1 to zero the distance and speed. The tracking task resets its counters and speed sampling baseline, publishes zeros to registers 200–205, then clears only coil 3 under the same Modbus semaphore. Read coil 3 returning to 0 as completion acknowledgement. The request works while tracking is paused or the motor is stopped. While moving, tracking resumes immediately from zero and the next sample can be nonzero; zeroing does not stop the motor. Normally completion takes up to 100 ms; semaphore contention leaves the request pending until a successful acquisition.
 
-`MotorControlTask` copies the coil word while holding the Modbus semaphore, then releases it before controlling GPIO/PWM or delaying. It polls every 10 RTOS ticks. Starting and reversing wait 10 ticks after setting direction, then re-read the enable/direction bits before starting PWM. A changed command or failed semaphore acquisition during this recheck leaves the motor disabled until a later poll. If the initial read fails while running, the current motion continues until a successful read.
+`MotorControlTask` copies the coil word while holding the Modbus semaphore, then releases it before controlling GPIO/PWM or delaying. It polls every 10 RTOS ticks. Starting and reversing wait 10 ticks after setting direction, then re-read the enable/direction bits and frequency before starting PWM. A changed command or failed semaphore acquisition during this recheck leaves the motor disabled until a later poll. If the initial read fails while running, the current motion continues until a successful read.
 
-The board starts stopped and checks commands every 10 RTOS ticks (10 ms with the current configuration). Forward drives PB10 high, backward drives it low; PB11 is treated as active-high enable, matching the previous firmware. TIM3 channel 1 (PA6) generates 100 Hz pulses with 50% duty cycle. PWM mode 2 starts each cycle low; its compare interrupt matches the rising STEP edge. Every restart resets the timer counter and clears stale compare/pending interrupt state. Confirm these polarities with the motor driver before testing.
+The board starts stopped and checks commands every 10 RTOS ticks (10 ms with the current configuration). Forward drives PB10 high, backward drives it low; PB11 is treated as active-high enable, matching the previous firmware. TIM3 channel 1 (PA6) generates pulses at the frequency commanded by holding register 300, defaulting to 100 Hz, with 50% duty cycle. Frequency commands are clamped to 100–700 Hz. The prescaler rounds to the nearest available divider, so 700 Hz produces approximately 701.754 Hz at the nominal 8 MHz timer clock. Changing frequency stops PWM, waits 10 ticks, and rechecks the command before restarting; this is not a speed ramp. PWM mode 2 starts each cycle low; its compare interrupt matches the rising STEP edge. Every restart resets the timer counter and clears stale compare/pending interrupt state. Confirm these polarities with the motor driver before testing.
 
 A direction change disables the driver and stops PWM for one poll cycle, then re-reads the command before starting in the new direction. This is an electrical pause, not a calibrated deceleration or brake. Verify the driver's timing and mechanical stopping requirements before operating under load.
 
@@ -39,4 +44,4 @@ Calibration constants are together in the `USER CODE BEGIN PD` section of `Core/
 
 The actual gearing is unknown, so the physical readings remain provisional until calibration constants are corrected. These values estimate commanded travel: missed steps, driver faults, and rope slip are not detected.
 
-Run the host checks with `python3 tests/test_motor_control.py` and `python3 tests/test_motion_tracking.py`. Build firmware with `cmake --build --preset Debug` using the STM32 toolchain. The RTOS heap is 6144 bytes to accommodate the motor control and motion tracking tasks, default task, Modbus, idle, and timer tasks.
+Run the host checks with `python3 tests/test_motor_control.py` and `python3 tests/test_motion_tracking.py` (including frequency changes and range limits in the motor test). Build firmware with `cmake --build --preset Debug` using the STM32 toolchain. The RTOS heap is 6144 bytes to accommodate the motor control and motion tracking tasks, default task, Modbus, idle, and timer tasks.

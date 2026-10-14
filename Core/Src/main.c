@@ -101,7 +101,7 @@ modbusHandler_t modbusHandle;
 uint16_t modbusCoilsData[1];            // 16 coils, Modbus addresses 0-15
 uint16_t modbusDiscreteInputsData[1];   // 16 discrete inputs, Modbus addresses 100-115
 uint16_t modbusInputRegistersData[6];   // Speed um/s 200-201, position um 202-205
-uint16_t modbusHoldingRegistersData[2]; // 2 holding registers, Modbus address 300-301
+uint16_t modbusHoldingRegistersData[2] = {100, 0}; // PWM Hz at 300; 301 reserved
 
 /* USER CODE END PV */
 
@@ -206,6 +206,9 @@ void MotorControlTask(void *argument)
 {
   const uint16_t commandMask = MOTOR_EN | MOTOR_CW;
   bool running = false;
+  uint16_t frequency = 100;
+  // APB1 divider is 1: TIM3 clock equals PCLK1; PWM period stays 100 counts.
+  const uint32_t timerClock = HAL_RCC_GetPCLK1Freq();
   GPIO_PinState direction = GPIO_PIN_RESET;
 
   while (true)
@@ -214,13 +217,16 @@ void MotorControlTask(void *argument)
     {
       uint16_t coils = modbusCoilsData[0];
       uint16_t command = coils & commandMask;
+      uint16_t requestedFrequency = modbusHoldingRegistersData[0];
+      if (requestedFrequency < 100) requestedFrequency = 100;
+      if (requestedFrequency > 700) requestedFrequency = 700;
       xSemaphoreGive(modbusHandle.ModBusSphrHandle);
 
       SetMotionTracking(coils);
       bool enabled = READ_BIT(command, MOTOR_EN);
       GPIO_PinState requestedDirection = READ_BIT(command, MOTOR_CW) ? GPIO_PIN_RESET : GPIO_PIN_SET;
 
-      if (running && (!enabled || requestedDirection != direction))
+      if (running && (!enabled || requestedDirection != direction || requestedFrequency != frequency))
       {
         taskENTER_CRITICAL();
         HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
@@ -243,11 +249,20 @@ void MotorControlTask(void *argument)
         {
           uint16_t latestCoils = modbusCoilsData[0];
           uint16_t latestCommand = latestCoils & commandMask;
+          uint16_t latestFrequency = modbusHoldingRegistersData[0];
+          if (latestFrequency < 100) latestFrequency = 100;
+          if (latestFrequency > 700) latestFrequency = 700;
           xSemaphoreGive(modbusHandle.ModBusSphrHandle);
           SetMotionTracking(latestCoils);
-          if (latestCommand == command)
+          if (latestCommand == command && latestFrequency == requestedFrequency)
           {
             taskENTER_CRITICAL();
+            __HAL_TIM_SET_PRESCALER(&htim3,
+                (timerClock / 100 + requestedFrequency / 2) / requestedFrequency - 1);
+            if (HAL_TIM_GenerateEvent(&htim3, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
+            {
+              Error_Handler(__FILE__, __LINE__);
+            }
             __HAL_TIM_SET_COUNTER(&htim3, 0);
             __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_CC1);
             HAL_NVIC_ClearPendingIRQ(TIM3_IRQn);
@@ -260,6 +275,7 @@ void MotorControlTask(void *argument)
             motionMotorRunning = true;
             taskEXIT_CRITICAL();
             direction = requestedDirection;
+            frequency = requestedFrequency;
             running = true;
           }
         }
@@ -358,7 +374,6 @@ int main(void)
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  ModbusComm_Init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -385,6 +400,7 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
+  ModbusComm_Init();
   /* add threads, ... */
   motorControlTaskHandle = osThreadNew(MotorControlTask, NULL, &motorControlTask_attributes);
   if (!motorControlTaskHandle)
