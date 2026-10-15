@@ -38,8 +38,8 @@ static uint32_t now;
 static uint32_t HAL_GetTick(void) { return now; }
 static uint32_t osKernelGetTickFreq(void) { return 1000; }
 static void osDelay(uint32_t ticks);
-static const int32_t expectedSpeed[] = {70,-14,0,0,0,70,0,-706,0,-70,0,-70,0,0,35,0,70,0,0,70,0,1413,-1413,0,0};
-static const int64_t expectedPosition[] = {7,3,3,10,17,24,24,-45,-46,-53,-53,-60,-60,0,3,0,7,14,0,7,0,141,0,6519617512269410304, -6519617512269410304};
+static const int32_t expectedSpeed[] = {19,-3,0,0,0,19,0,-191,0,-19,0,-19,0,0,9,0,19,0,0,19,0,382,-382,0,0};
+static const int64_t expectedPosition[] = {1,0,0,2,4,6,6,-12,-12,-14,-14,-16,-16,0,0,0,1,3,0,1,0,38,0,1762058787099840768,-1762058787099840768};
 static uint64_t publishedPosition(void) {
   uint64_t result = 0;
   for (int i = 2; i < 6; ++i) result = (result << 16) | modbusInputRegistersData[i];
@@ -49,7 +49,7 @@ static int xSemaphoreTake(int handle, int timeout) {
   (void)handle; assert(timeout == 0 && !locked && !critical);
   assert(sample != 8); // A zero-length sample must not publish or discard pulses.
   if (sample == 3 || sample == 4 || sample == 17) {
-    assert(publishedPosition() == (sample == 17 ? 7 : 3));
+    assert(publishedPosition() == (sample == 17 ? 1 : 0));
     if (sample == 17) assert(modbusCoilsData[0] & MOTION_ZERO);
     return 0;
   }

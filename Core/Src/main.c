@@ -51,9 +51,9 @@
 #define MOTION_TRACK_EN  (1u << 2u)    // Coil 2
 #define MOTION_ZERO      (1u << 3u)    // Coil 3
 #define WHEEL_RADIUS_MM 22.5
-// shortcut: full stepping and 1:1 gearing assumed; update these after driver/gear calibration.
+// shortcut: full stepping assumed; update pulses per revolution if driver microstepping is enabled.
 #define MOTOR_PULSES_PER_REV 200.0
-#define MOTOR_REVS_PER_WHEEL_REV 1.0
+#define MOTOR_REVS_PER_WHEEL_REV 3.7
 #define MOTION_MM_PER_PULSE (2.0 * 3.141592653589793 * WHEEL_RADIUS_MM / \
                              (MOTOR_PULSES_PER_REV * MOTOR_REVS_PER_WHEEL_REV))
 /* USER CODE END PD */
