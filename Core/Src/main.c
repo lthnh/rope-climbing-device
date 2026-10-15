@@ -230,7 +230,7 @@ void MotorControlTask(void *argument)
       if (running && (!enabled || requestedDirection != direction || requestedFrequency != frequency))
       {
         taskENTER_CRITICAL();
-        HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
         if (HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
         {
           Error_Handler(__FILE__, __LINE__);
@@ -272,7 +272,7 @@ void MotorControlTask(void *argument)
             {
               Error_Handler(__FILE__, __LINE__);
             }
-            HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
             motionMotorRunning = true;
             taskEXIT_CRITICAL();
             direction = requestedDirection;
@@ -597,7 +597,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
 
   /*Configure GPIO pins : PB10 PB11 */
   GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
@@ -665,7 +665,7 @@ void Error_Handler(const char* file, int line)
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   printf("Error occured at %s, line %d\n", file, line);
-  HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
   HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1);
   while (1)
   {

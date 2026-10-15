@@ -65,7 +65,7 @@ static void xSemaphoreGive(int handle) { (void)handle; assert(locked); locked = 
 static void HAL_GPIO_WritePin(int port, int pin, int value) {
   (void)port; assert(!locked);
   if (pin == CW_PIN) { assert(!enabled && !pwm); direction = value; pause = 1; htim3.pending = 1; }
-  else { enabled = value; if (value) assert(pwm); }
+  else { enabled = (value == GPIO_PIN_RESET); if (enabled) assert(pwm); }
 }
 static int HAL_TIM_PWM_Start_IT(TIM_HandleTypeDef *timer, int channel) {
   (void)timer; (void)channel; assert(!locked && !enabled && !pwm);
