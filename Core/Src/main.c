@@ -112,6 +112,7 @@ static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 void StartDefaultTask(void *argument);
 
+static void MX_NVIC_Init(void);
 /* USER CODE BEGIN PFP */
 void MotorControlTask(void *argument);
 void MotionTrackingTask(void *argument);
@@ -373,6 +374,9 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
+
+  /* Initialize interrupts */
+  MX_NVIC_Init();
   /* USER CODE BEGIN 2 */
   /* USER CODE END 2 */
 
@@ -468,6 +472,17 @@ void SystemClock_Config(void)
   {
     Error_Handler(__FILE__, __LINE__);
   }
+}
+
+/**
+  * @brief NVIC Configuration.
+  * @retval None
+  */
+static void MX_NVIC_Init(void)
+{
+  /* USART1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 /**
