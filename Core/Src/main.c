@@ -96,12 +96,15 @@ static volatile bool motionMotorRunning;
 static volatile int32_t motionDirection = 1;
 static volatile uint64_t motionPosition; // Unsigned storage preserves two's-complement wrap.
 static volatile int32_t motionIntervalPulses;
+static volatile uint64_t travelRemainingPulses;
+static volatile bool travelComplete;
+static volatile bool travelStopFailed;
 
 modbusHandler_t modbusHandle;
 uint16_t modbusCoilsData[1];            // 16 coils, Modbus addresses 0-15
 uint16_t modbusDiscreteInputsData[1];   // 16 discrete inputs, Modbus addresses 100-115
-uint16_t modbusInputRegistersData[6];   // Speed um/s 200-201, position mm 202-205
-uint16_t modbusHoldingRegistersData[2] = {100, 0}; // PWM Hz at 300; 301 reserved
+uint16_t modbusInputRegistersData[6];   // Speed mm/s 200-201, position mm 202-205
+uint16_t modbusHoldingRegistersData[5] = {100}; // Speed mm/s at 300; signed relative mm at 301-304
 
 /* USER CODE END PV */
 
@@ -162,7 +165,7 @@ void ModbusComm_Init(void)
   // Holding Registers — FC3, FC6, FC16
   modbusHandle.u16holdingRegs          = modbusHoldingRegistersData;
   modbusHandle.u16holdingRegsStartAdd  = 300;
-  modbusHandle.u16holdingRegsNregs     = 2;
+  modbusHandle.u16holdingRegsNregs     = 5;
 
   ModbusInit(&modbusHandle);
   ModbusStart(&modbusHandle);
@@ -170,10 +173,18 @@ void ModbusComm_Init(void)
 
 static void RecordMotionPulse(void)
 {
-  if (motionMotorRunning && motionTrackingEnabled)
+  if (!motionMotorRunning) return;
+  if (motionTrackingEnabled)
   {
     motionPosition += motionDirection;
     motionIntervalPulses += motionDirection;
+  }
+  if (travelRemainingPulses && --travelRemainingPulses == 0)
+  {
+    HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
+    travelStopFailed = HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1) != HAL_OK;
+    motionMotorRunning = false;
+    travelComplete = true;
   }
 }
 
@@ -203,81 +214,131 @@ static void SetMotionTracking(uint16_t coils)
   taskEXIT_CRITICAL();
 }
 
+static uint16_t SpeedFrequency(uint16_t speed)
+{
+  if (speed == 0) return 0;
+  double frequency = speed / MOTION_MM_PER_PULSE;
+  if (frequency < 100.0) frequency = 100.0;
+  if (frequency > 700.0) frequency = 700.0;
+  return (uint16_t)(frequency + 0.5);
+}
+
+static uint64_t ReadTravelCommand(void)
+{
+  uint64_t distance = 0;
+  for (unsigned int i = 1; i < 5; ++i)
+    distance = (distance << 16) | modbusHoldingRegistersData[i];
+  return distance;
+}
+
 void MotorControlTask(void *argument)
 {
-  const uint16_t commandMask = MOTOR_EN | MOTOR_CW;
   bool running = false;
-  uint16_t frequency = 100;
+  bool wasEnabled = false;
+  bool finiteMove = false;
+  GPIO_PinState moveDirection = GPIO_PIN_SET;
+  uint16_t frequency = 0;
   // APB1 divider is 1: TIM3 clock equals PCLK1; PWM period stays 100 counts.
   const uint32_t timerClock = HAL_RCC_GetPCLK1Freq();
   GPIO_PinState direction = GPIO_PIN_RESET;
 
   while (true)
   {
+    if (travelStopFailed) Error_Handler(__FILE__, __LINE__);
     if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
     {
+      // Acknowledge completion before accepting another enable edge.
+      taskENTER_CRITICAL();
+      if (travelComplete)
+      {
+        modbusCoilsData[0] &= ~MOTOR_EN;
+        travelComplete = false;
+        running = false;
+      }
+      taskEXIT_CRITICAL();
       uint16_t coils = modbusCoilsData[0];
-      uint16_t command = coils & commandMask;
-      uint16_t requestedFrequency = modbusHoldingRegistersData[0];
-      if (requestedFrequency < 100) requestedFrequency = 100;
-      if (requestedFrequency > 700) requestedFrequency = 700;
+      uint16_t speed = modbusHoldingRegistersData[0];
+      uint64_t distance = ReadTravelCommand();
       xSemaphoreGive(modbusHandle.ModBusSphrHandle);
 
       SetMotionTracking(coils);
-      bool enabled = READ_BIT(command, MOTOR_EN);
-      GPIO_PinState requestedDirection = READ_BIT(command, MOTOR_CW) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+      bool enabled = (coils & MOTOR_EN) != 0;
+      GPIO_PinState requestedDirection = (coils & MOTOR_CW) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+      uint16_t requestedFrequency = SpeedFrequency(speed);
+      if (enabled && !wasEnabled)
+      {
+        finiteMove = distance != 0;
+        bool backward = (distance >> 63) != 0;
+        uint64_t magnitude = backward ? UINT64_C(0) - distance : distance;
+        moveDirection = backward ? GPIO_PIN_RESET : GPIO_PIN_SET;
+        taskENTER_CRITICAL();
+        travelRemainingPulses = (uint64_t)(magnitude / MOTION_MM_PER_PULSE + 0.5);
+        if (finiteMove && !travelRemainingPulses) travelRemainingPulses = 1;
+        taskEXIT_CRITICAL();
+      }
+      wasEnabled = enabled;
+      if (finiteMove) requestedDirection = moveDirection;
 
-      if (running && (!enabled || requestedDirection != direction || requestedFrequency != frequency))
+      if (running && (!enabled || !requestedFrequency || requestedDirection != direction || requestedFrequency != frequency))
       {
         taskENTER_CRITICAL();
-        HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
-        if (HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
+        if (motionMotorRunning)
         {
-          Error_Handler(__FILE__, __LINE__);
+          HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_SET);
+          if (HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
+            Error_Handler(__FILE__, __LINE__);
         }
+        // Stop the timer before flushing so an edge during shutdown is counted.
         FlushMotionPulse();
         motionMotorRunning = false;
         taskEXIT_CRITICAL();
         running = false;
       }
+      if (!enabled)
+      {
+        taskENTER_CRITICAL();
+        travelRemainingPulses = 0;
+        taskEXIT_CRITICAL();
+      }
 
-      if (enabled && !running)
+      if (enabled && requestedFrequency && !running && !travelComplete)
       {
         HAL_GPIO_WritePin(GPIOB, CW_PIN, requestedDirection);
         osDelay(10);
-        // Re-read after the pause without blocking Modbus writes during it.
+        // Re-read live commands after the pause without blocking Modbus writes.
         if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
         {
           uint16_t latestCoils = modbusCoilsData[0];
-          uint16_t latestCommand = latestCoils & commandMask;
-          uint16_t latestFrequency = modbusHoldingRegistersData[0];
-          if (latestFrequency < 100) latestFrequency = 100;
-          if (latestFrequency > 700) latestFrequency = 700;
+          uint16_t latestSpeed = modbusHoldingRegistersData[0];
           xSemaphoreGive(modbusHandle.ModBusSphrHandle);
           SetMotionTracking(latestCoils);
-          if (latestCommand == command && latestFrequency == requestedFrequency)
+          if ((latestCoils & MOTOR_EN) && latestSpeed == speed &&
+              (finiteMove || ((latestCoils ^ coils) & MOTOR_CW) == 0))
           {
             taskENTER_CRITICAL();
             __HAL_TIM_SET_PRESCALER(&htim3,
                 (timerClock / 100 + requestedFrequency / 2) / requestedFrequency - 1);
             if (HAL_TIM_GenerateEvent(&htim3, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
-            {
               Error_Handler(__FILE__, __LINE__);
-            }
             __HAL_TIM_SET_COUNTER(&htim3, 0);
             __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_CC1);
             HAL_NVIC_ClearPendingIRQ(TIM3_IRQn);
             motionDirection = requestedDirection == GPIO_PIN_SET ? 1 : -1;
             if (HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
-            {
               Error_Handler(__FILE__, __LINE__);
-            }
             HAL_GPIO_WritePin(GPIOB, EN_PIN, GPIO_PIN_RESET);
             motionMotorRunning = true;
             taskEXIT_CRITICAL();
             direction = requestedDirection;
             frequency = requestedFrequency;
             running = true;
+          }
+          else if (!(latestCoils & MOTOR_EN))
+          {
+            wasEnabled = false;
+            taskENTER_CRITICAL();
+            travelRemainingPulses = 0;
+            taskEXIT_CRITICAL();
           }
         }
       }
@@ -310,7 +371,7 @@ void MotionTrackingTask(void *argument)
       continue;
     }
     previousTime = now;
-    // shortcut: current calibration and 100 Hz PWM fit int32 speed; revisit if either changes.
+    // shortcut: current calibration and 700 Hz PWM fit int32 speed; revisit if either changes.
     int32_t speed = active ? (int32_t)(pulses * MOTION_MM_PER_PULSE * 1000.0 / elapsed) : 0;
     double distanceMm = (int64_t)position * MOTION_MM_PER_PULSE;
     // Saturate physical distance rather than overflowing the signed Modbus value.

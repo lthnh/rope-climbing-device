@@ -5,7 +5,7 @@ import tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'Core/Src/main.c').read_text()
 helpers = source[source.index('static void RecordMotionPulse(void)\n{'):
-                 source.index('void MotorControlTask(void *argument)\n{')]
+                 source.index('static uint16_t SpeedFrequency(uint16_t speed)\n{')]
 task = source[source.index('void MotionTrackingTask(void *argument)\n{'):
               source.index('/* USER CODE END 0 */')]
 calibration = source[source.index('#define WHEEL_RADIUS_MM'):source.index('/* USER CODE END PD */')]
@@ -26,6 +26,15 @@ static TIM_HandleTypeDef htim3 = {TIM3, HAL_TIM_ACTIVE_CHANNEL_1, 0};
 static volatile bool motionTrackingEnabled, motionMotorRunning;
 static volatile int32_t motionDirection = 1, motionIntervalPulses;
 static volatile uint64_t motionPosition;
+static volatile uint64_t travelRemainingPulses;
+static volatile bool travelComplete, travelStopFailed;
+#define GPIOB 0
+#define EN_PIN 11
+#define GPIO_PIN_SET 1
+#define TIM_CHANNEL_1 1
+#define HAL_OK 0
+static void HAL_GPIO_WritePin(int port, int pin, int value) { assert(0); }
+static int HAL_TIM_PWM_Stop_IT(TIM_HandleTypeDef *timer, int channel) { assert(0); return HAL_OK; }
 static uint16_t modbusInputRegistersData[6];
 static uint16_t modbusCoilsData[1];
 static struct { int ModBusSphrHandle; } modbusHandle;
