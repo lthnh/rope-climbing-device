@@ -11,8 +11,8 @@ USART1 interrupts must be enabled at priority 5 and dispatched through `USART1_I
 | Motion tracking enable (coil) | 2 | 01 read, 05/15 write | 0 pause tracking, 1 track |
 | Zero motion estimates (coil) | 3 | 01 read, 05/15 write | Write 1 to zero; firmware clears to 0 on completion |
 | Discrete inputs | 100–115 | 02 read | Reserved; initially zero |
-| Estimated speed | 200–201 | 04 read | Signed 32-bit mm/s × 1000 (µm/s) |
-| Estimated position | 202–205 | 04 read | Signed 64-bit mm × 1000 (µm), from boot or last zero |
+| Estimated speed | 200–201 | 04 read | Signed 32-bit mm/s |
+| Estimated position | 202–205 | 04 read | Signed 64-bit mm, from boot or last zero |
 | PWM frequency | 300 | 03 read, 06/16 write | Hz, default 100; commands clamped to 100–700 |
 | Reserved holding register | 301 | 03 read, 06/16 write | Separate storage |
 
@@ -32,9 +32,9 @@ Commands remain latched until overwritten: disconnecting the HMI does not stop m
 
 `EN_Port = NULL` assumes a serial interface that needs no firmware-controlled RS-485 direction pin (for example, an automatic-direction transceiver). Never connect STM32 UART pins directly to RS-485 signals. Configure the appropriate transceiver and DE pin if your hardware needs it.
 
-`MotionTrackingTask` samples every 100 RTOS ticks (100 ms at the current 1 kHz tick rate), calculates signed speed using actual elapsed milliseconds, and publishes all six registers together under the Modbus semaphore. Speed and distance are scaled integers, truncating toward zero at 0.001 mm/s and 0.001 mm resolution. Speed is averaged over the sampling interval; stopped motion or disabled tracking reports zero. Net forward/backward pulses within one interval can cancel. A failed semaphore acquisition leaves registers unchanged until a later sample publishes the latest position and rate; pulse accounting continues.
+`MotionTrackingTask` samples every 100 RTOS ticks (100 ms at the current 1 kHz tick rate), calculates signed speed using actual elapsed milliseconds, and publishes all six registers together under the Modbus semaphore. Speed and distance are integers in mm/s and mm, truncating toward zero at 1 mm/s and 1 mm resolution. Speed is averaged over the sampling interval; stopped motion or disabled tracking reports zero. Net forward/backward pulses within one interval can cancel. A failed semaphore acquisition leaves registers unchanged until a later sample publishes the latest position and rate; pulse accounting continues.
 
-Read addresses 200–205 together with FC4 for a consistent snapshot. Multi-register values use two’s complement, most significant 16-bit word first. Configure the HMI to divide both raw values by **1000**, showing **mm/s** and **mm** with three decimal places. For example, raw speed 70685 displays 70.685 mm/s; raw distance -1000 (`FFFF FFFF FFFF FC18`) displays -1.000 mm. Addresses and signed word order stay the same, but their units have changed from pulses to physical units; update existing HMI displays accordingly. Coil 2 changes take effect when the motor task successfully polls it, normally within 10 ms; motor startup also rechecks it after the direction pause. HMI readings normally update within 100 ms after that. Semaphore contention can extend either delay.
+Read addresses 200–205 together with FC4 for a consistent snapshot. Multi-register values use two’s complement, most significant 16-bit word first. Configure the HMI to display both raw values directly as **mm/s** and **mm**, with no division. For example, raw speed 70 displays 70 mm/s; raw distance -1 (`FFFF FFFF FFFF FFFF`) displays -1 mm. Addresses and signed word order stay the same, but the units have changed from micrometres to millimetres; remove the previous /1000 scaling from existing HMI displays. Coil 2 changes take effect when the motor task successfully polls it, normally within 10 ms; motor startup also rechecks it after the direction pause. HMI readings normally update within 100 ms after that. Semaphore contention can extend either delay.
 
 TIM3 IRQ priority 5 allows short FreeRTOS critical sections to protect the counter and account for pending edges at stop or tracking changes. The ISR performs only integer counting. Confirm the driver steps on the rising edge of PA6, and compare PA6 pulses against the counter on hardware, including starts, stops, and reversals.
 

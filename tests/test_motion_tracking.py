@@ -38,8 +38,8 @@ static uint32_t now;
 static uint32_t HAL_GetTick(void) { return now; }
 static uint32_t osKernelGetTickFreq(void) { return 1000; }
 static void osDelay(uint32_t ticks);
-static const int32_t expectedSpeed[] = {70685,-14137,0,0,0,70685,0,-706858,0,-70685,0,-70685,0,0,35342,0,70685,0,0,70685,0,1413716,-1413716,0,0};
-static const int64_t expectedPosition[] = {7068,3534,3534,10602,17671,24740,24740,-45945,-46652,-53014,-53014,-60082,-60789,0,3534,0,7068,14137,0,7068,0,141371,0,INT64_MAX,INT64_MIN};
+static const int32_t expectedSpeed[] = {70,-14,0,0,0,70,0,-706,0,-70,0,-70,0,0,35,0,70,0,0,70,0,1413,-1413,0,0};
+static const int64_t expectedPosition[] = {7,3,3,10,17,24,24,-45,-46,-53,-53,-60,-60,0,3,0,7,14,0,7,0,141,0,6519617512269410304, -6519617512269410304};
 static uint64_t publishedPosition(void) {
   uint64_t result = 0;
   for (int i = 2; i < 6; ++i) result = (result << 16) | modbusInputRegistersData[i];
@@ -49,7 +49,7 @@ static int xSemaphoreTake(int handle, int timeout) {
   (void)handle; assert(timeout == 0 && !locked && !critical);
   assert(sample != 8); // A zero-length sample must not publish or discard pulses.
   if (sample == 3 || sample == 4 || sample == 17) {
-    assert(publishedPosition() == (sample == 17 ? 7068 : 3534));
+    assert(publishedPosition() == (sample == 17 ? 7 : 3));
     if (sample == 17) assert(modbusCoilsData[0] & MOTION_ZERO);
     return 0;
   }
@@ -138,4 +138,4 @@ with tempfile.TemporaryDirectory() as directory:
                     '-Wno-unused-parameter', '-fsanitize=undefined',
                     str(test), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print('Wheel conversion, signed distance/speed, saturation, pulse tracking, and zeroing passed.')
+print('Wheel conversion, signed millimetre distance/speed, extreme positions, pulse tracking, and zeroing passed.')

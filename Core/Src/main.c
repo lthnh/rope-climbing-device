@@ -54,7 +54,7 @@
 // shortcut: full stepping and 1:1 gearing assumed; update these after driver/gear calibration.
 #define MOTOR_PULSES_PER_REV 200.0
 #define MOTOR_REVS_PER_WHEEL_REV 1.0
-#define MOTION_UM_PER_PULSE (2.0 * 3.141592653589793 * WHEEL_RADIUS_MM * 1000.0 / \
+#define MOTION_MM_PER_PULSE (2.0 * 3.141592653589793 * WHEEL_RADIUS_MM / \
                              (MOTOR_PULSES_PER_REV * MOTOR_REVS_PER_WHEEL_REV))
 /* USER CODE END PD */
 
@@ -100,7 +100,7 @@ static volatile int32_t motionIntervalPulses;
 modbusHandler_t modbusHandle;
 uint16_t modbusCoilsData[1];            // 16 coils, Modbus addresses 0-15
 uint16_t modbusDiscreteInputsData[1];   // 16 discrete inputs, Modbus addresses 100-115
-uint16_t modbusInputRegistersData[6];   // Speed um/s 200-201, position um 202-205
+uint16_t modbusInputRegistersData[6];   // Speed um/s 200-201, position mm 202-205
 uint16_t modbusHoldingRegistersData[2] = {100, 0}; // PWM Hz at 300; 301 reserved
 
 /* USER CODE END PV */
@@ -311,11 +311,11 @@ void MotionTrackingTask(void *argument)
     }
     previousTime = now;
     // shortcut: current calibration and 100 Hz PWM fit int32 speed; revisit if either changes.
-    int32_t speed = active ? (int32_t)(pulses * MOTION_UM_PER_PULSE * 1000.0 / elapsed) : 0;
-    double distanceUm = (int64_t)position * MOTION_UM_PER_PULSE;
+    int32_t speed = active ? (int32_t)(pulses * MOTION_MM_PER_PULSE * 1000.0 / elapsed) : 0;
+    double distanceMm = (int64_t)position * MOTION_MM_PER_PULSE;
     // Saturate physical distance rather than overflowing the signed Modbus value.
-    int64_t distance = distanceUm >= (double)INT64_MAX ? INT64_MAX :
-                       distanceUm <= (double)INT64_MIN ? INT64_MIN : (int64_t)distanceUm;
+    int64_t distance = distanceMm >= (double)INT64_MAX ? INT64_MAX :
+                       distanceMm <= (double)INT64_MIN ? INT64_MIN : (int64_t)distanceMm;
     if (xSemaphoreTake(modbusHandle.ModBusSphrHandle, 0) == pdTRUE)
     {
       if (modbusCoilsData[0] & MOTION_ZERO)
