@@ -514,7 +514,6 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler(__FILE__, __LINE__);
   }
-  // PWM2 compare is the rising STEP edge, so the callback counts emitted pulses.
   sConfigOC.OCMode = TIM_OCMODE_PWM2;
   sConfigOC.Pulse = 50;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
@@ -645,7 +644,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
-void Error_Handler(const char *file, int line)
+void Error_Handler(const char* file, int line)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
