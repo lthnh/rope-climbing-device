@@ -50,7 +50,7 @@
 #define MOTOR_CW         (1u << 1u)    // Coil 1
 #define MOTION_TRACK_EN  (1u << 2u)    // Coil 2
 #define MOTION_ZERO      (1u << 3u)    // Coil 3
-#define WHEEL_RADIUS_MM 22.5
+#define WHEEL_RADIUS_MM 30.0
 // shortcut: full stepping and 1:1 gearing assumed; update these after driver/gear calibration.
 #define MOTOR_PULSES_PER_REV 200.0
 #define MOTOR_REVS_PER_WHEEL_REV 3.7
